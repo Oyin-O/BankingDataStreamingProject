@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: banking_db
+    schema: bronze
+    tables:
+      - name: transactions
+      - name: customers
+      - name: accounts
+      - name: transaction_legs
+      - name: banks

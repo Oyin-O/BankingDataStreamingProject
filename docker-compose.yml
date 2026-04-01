@@ -1,0 +1,287 @@
+networks:
+  banking-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  airflow_db_data:
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    networks:
+      - banking-network
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: banking
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=5
+        -c max_wal_senders=5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d banking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    networks:
+      - banking-network
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    networks:
+      - banking-network
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: schema-registry
+    networks:
+      - banking-network
+    ports:
+      - "8081:8081"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.5.0
+    container_name: control-center
+    networks:
+      - banking-network
+    ports:
+      - "9021:9021"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: kafka:9092
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONTROL_CENTER_CONNECT_CONNECT_CLUSTER: http://debezium:8083
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      PORT: 9021
+
+
+  debezium:
+    image: debezium/connect:2.4
+    container_name: debezium
+    networks:
+      - banking-network
+    ports:
+      - "8083:8083"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: debezium-group
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+
+
+  spark:
+    build:
+      context: ./spark-jobs
+      dockerfile: Dockerfile
+    container_name: spark
+    networks:
+      - banking-network
+    ports:
+      - "4040:4040"
+      - "8085:8080"
+      - "7077:7077"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - SPARK_USER=spark
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    restart: unless-stopped
+
+  spark-worker:
+    build:
+      context: ./spark-jobs
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    networks:
+      - banking-network
+    depends_on:
+      - spark
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - SPARK_USER=spark
+      - SPARK_WORKER_DIR=/tmp/spark-worker
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+    restart: unless-stopped
+
+  airflow-db:
+    image: postgres:15
+    container_name: airflow-db
+    networks:
+      - banking-network
+    environment:
+      POSTGRES_USER: "${airflow_db_USER}"
+      POSTGRES_PASSWORD: "${airflow_db_PASSWORD}"
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${airflow_db_USER}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.8.0
+    container_name: airflow-init
+    networks:
+      - banking-network
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${airflow_db_USER}:${airflow_db_PASSWORD}@airflow-db/airflow"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    command: db init
+    restart: on-failure
+
+  airflow-webserver:
+    image: apache/airflow:2.8.0
+    container_name: airflow-webserver
+    networks:
+      - banking-network
+    ports:
+      - "8082:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${airflow_db_USER}:${airflow_db_PASSWORD}@airflow-db/airflow"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-snowflake dbt-snowflake"
+      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+      DBT_PRIVATE_KEY_PATH: /opt/airflow/keys/dbt_snow_key.p8
+      AIRFLOW_CONN_SNOWFLAKE_DEFAULT: ${AIRFLOW_CONN_SNOWFLAKE_DEFAULT}
+      AIRFLOW__SMTP__SMTP_HOST: "smtp.gmail.com"
+      AIRFLOW__SMTP__SMTP_PORT: "587"
+      AIRFLOW__SMTP__SMTP_USER: "${ALERT_EMAIL}"
+      AIRFLOW__SMTP__SMTP_PASSWORD: "${ALERT_EMAIL_PASSWORD}"
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: "${ALERT_EMAIL}"
+      AIRFLOW__SMTP__SMTP_SSL: "False"
+      AIRFLOW__SMTP__SMTP_STARTTLS: "True"
+      AIRFLOW_VAR_ALERT_EMAIL: ${ALERT_EMAIL}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./banking_dbt:/opt/airflow/dbt/banking_dbt
+      - ~/.ssh:/opt/airflow/keys
+    command: webserver
+    restart: on-failure
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.0
+    container_name: airflow-scheduler
+    networks:
+      - banking-network
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://${airflow_db_USER}:${airflow_db_PASSWORD}@airflow-db/airflow"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-snowflake dbt-snowflake"
+      SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+      DBT_PRIVATE_KEY_PATH: /opt/airflow/keys/dbt_snow_key.p8
+      AIRFLOW_CONN_SNOWFLAKE_DEFAULT: ${AIRFLOW_CONN_SNOWFLAKE_DEFAULT}
+      AIRFLOW__SMTP__SMTP_HOST: "smtp.gmail.com"
+      AIRFLOW__SMTP__SMTP_PORT: "587"
+      AIRFLOW__SMTP__SMTP_USER: "${ALERT_EMAIL}"
+      AIRFLOW__SMTP__SMTP_PASSWORD: "${ALERT_EMAIL_PASSWORD}"
+      AIRFLOW__SMTP__SMTP_MAIL_FROM: "${ALERT_EMAIL}"
+      AIRFLOW__SMTP__SMTP_SSL: "False"
+      AIRFLOW__SMTP__SMTP_STARTTLS: "True"
+      AIRFLOW_VAR_ALERT_EMAIL: ${ALERT_EMAIL}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./banking_dbt:/opt/airflow/dbt/banking_dbt
+      - ~/.ssh:/opt/airflow/keys
+    command: scheduler
+    restart: on-failure

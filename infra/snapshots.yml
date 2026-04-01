@@ -1,0 +1,27 @@
+version: 2
+
+snapshots:
+  - name: customers_snapshot
+    relation: "{{ ref('silver_customers') }}"
+    config:
+      target_schema: snapshots
+      unique_key: customer_id
+      strategy: check
+      check_cols:
+        - full_name
+        - email
+        - phone
+        - nationality
+    filter: "cdc_op IN ('u', 'c')"
+
+  - name: accounts_snapshot
+    relation: "{{ ref('silver_accounts') }}"
+    config:
+      target_schema: snapshots
+      unique_key: account_id
+      strategy: check
+      check_cols:
+        - account_type
+        - balance
+        - currency
+    filter: "cdc_op IN ('u', 'c')"

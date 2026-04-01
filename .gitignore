@@ -1,0 +1,35 @@
+.env
+*.env
+terraform/.terraform
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+*.tfvars
+keys/
+*.pem
+*.pub
+banking_dbt/profiles.yml
+.txt
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+venv/
+.venv/
+env/
+*.jar
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+
+# dbt
+banking_dbt/.user.yml
+banking_dbt/logs/
+banking_dbt/target/
+
+# Generated files
+debezium-connector.json
+infra/snowflake/output.csv
